@@ -9,6 +9,10 @@ from data_preprocessing import preprocess_data, load_and_prepare_data
 import matplotlib.pyplot as plt
 import logging
 
+
+# Check device(s)
+print(jax.devices())
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
