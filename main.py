@@ -1,46 +1,59 @@
-import tensorflow_datasets as tfds
+import torch
+from torchtext.datasets import IMDB
+from torchtext.data.utils import get_tokenizer
+from torchtext.vocab import build_vocab_from_iterator
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from flax.training import train_state
 import optax
 from model import CNN
-from data_preprocessing import preprocess_data, load_and_prepare_data
-import matplotlib.pyplot as plt
-import logging
 
+# Data Processing
+tokenizer = get_tokenizer("basic_english")
 
-# Check device(s)
-print(jax.devices())
+def yield_tokens(data_iter):
+    for _, text in data_iter:
+        yield tokenizer(text)
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Create vocab from training data
+train_iter = IMDB(split='train')
+vocab = build_vocab_from_iterator(yield_tokens(train_iter), specials=["<unk>"])
+vocab.set_default_index(vocab["<unk>"])
 
-# Load and prepare data
-try:
-    train_data, test_data = load_and_prepare_data()
-    logger.info("Data loaded and preprocessed successfully.")
-except Exception as e:
-    logger.error(f"Error loading or preprocessing data: {e}")
-    raise
+text_pipeline = lambda x: [vocab[token] for token in tokenizer(x)]
+label_pipeline = lambda x: 1 if x == 'pos' else 0
 
-# Initialize model
-model = CNN()
+def collate_batch(batch):
+    label_list, text_list, offsets = [], [], [0]
+    for (_label, _text) in batch:
+         label_list.append(label_pipeline(_label))
+         processed_text = torch.tensor(text_pipeline(_text), dtype=torch.int64)
+         text_list.append(processed_text)
+         offsets.append(processed_text.size(0))
+    label_list = torch.tensor(label_list, dtype=torch.int64)
+    offsets = torch.tensor(offsets[:-1]).cumsum(dim=0)
+    text_list = torch.cat(text_list)
+    return label_list.to(torch.float32), text_list, offsets
+
+# DataLoader
+from torch.utils.data import DataLoader
+train_iter, test_iter = IMDB(split='train'), IMDB(split='test')
+train_dataloader = DataLoader(train_iter, batch_size=64, shuffle=True, collate_fn=collate_batch)
+test_dataloader = DataLoader(test_iter, batch_size=64, collate_fn=collate_batch)
+
+# Model and Training Setup
+model = CNN(num_embeddings=len(vocab))
 rng = jax.random.PRNGKey(0)
-x = jnp.ones((1, 200))  # Dummy input based on max_length from preprocessing
-variables = model.init(rng, x)
+dummy_input = jnp.ones((1, 200))  # Assuming a max sequence length of 200 for example
+variables = model.init(rng, dummy_input)
 
-# Setup training
-learning_rate = 0.001
-optimizer = optax.adam(learning_rate)
+optimizer = optax.adam(learning_rate=0.001)
 opt_state = optimizer.init(variables['params'])
 
 @jax.jit
 def compute_loss(params, x, y):
     logits = model.apply(params, x)
-    loss = optax.sigmoid_binary_cross_entropy(logits, y).mean()
-    return loss
+    return optax.sigmoid_binary_cross_entropy(logits, y).mean()
 
 @jax.jit
 def update(params, opt_state, x, y):
@@ -49,36 +62,27 @@ def update(params, opt_state, x, y):
     params = optax.apply_updates(params, updates)
     return params, opt_state
 
-# Lists to store losses for plotting
-train_losses = []
-
 # Training loop
 for epoch in range(10):
-    epoch_loss = 0.0
-    for i in range(0, len(train_data['X']), 64):  # Batch size of 64
-        batch = train_data['X'][i:i+64]
-        targets = jnp.array(train_data['y'][i:i+64])
-        variables['params'], opt_state = update(variables['params'], opt_state, batch, targets)
-        epoch_loss += compute_loss(variables['params'], batch, targets).item()
-    avg_loss = epoch_loss / (len(train_data['X']) // 64)
-    train_losses.append(avg_loss)
-    logger.info(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")
+    for batch in train_dataloader:
+        labels, texts, offsets = batch
+        texts_jax = jnp.array(texts.numpy())
+        labels_jax = jnp.array(labels.numpy())
+        variables['params'], opt_state = update(variables['params'], opt_state, texts_jax, labels_jax)
+    
+    print(f"Epoch {epoch} completed")
 
 # Evaluation
-try:
-    predictions = model.apply(variables['params'], test_data['X'])
-    binary_predictions = (predictions > 0.5).astype(int)
-    accuracy = jnp.mean(binary_predictions.flatten() == jnp.array(test_data['y']))
-    logger.info(f"Test Accuracy: {accuracy:.4f}")
-    
-    # Visualization
-    plt.figure(figsize=(10, 5))
-    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training Loss Over Time')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-except Exception as e:
-    logger.error(f"Error during evaluation or plotting: {e}")
+correct = 0
+total = 0
+for batch in test_dataloader:
+    labels, texts, offsets = batch
+    texts_jax = jnp.array(texts.numpy())
+    labels_jax = jnp.array(labels.numpy())
+    predictions = model.apply(variables['params'], texts_jax)
+    binary_predictions = (predictions > 0.5).astype(jnp.int32)
+    correct += jnp.sum(jnp.equal(binary_predictions, labels_jax))
+    total += labels_jax.size
+
+accuracy = correct / total
+print(f"Test Accuracy: {accuracy}")
